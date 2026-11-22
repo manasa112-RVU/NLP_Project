@@ -50,7 +50,7 @@ SENTIMENT_FILE = DATA_DIR / "sentiment_results.csv"
 VERIFIED_FILE = DATA_DIR / "youtube_comments_verified.csv"
 CLEANED_FILE = DATA_DIR / "cleaned_youtube_comments.csv"
 COLLECTED_FILE = DATA_DIR / "youtube_comments_collected.csv"  # written by this app
-POSTER_CACHE_FILE = DATA_DIR / "poster_cache_v3.csv"             # written by this app
+POSTER_CACHE_FILE = DATA_DIR / "poster_cache_v4.csv"             # written by this app
 ANALYSIS_CACHE_FILE = DATA_DIR / "analysis_cache.csv"         # written by this app
 
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
@@ -305,6 +305,11 @@ LIVE_CATALOGUE_FILE = DATA_DIR / "live_catalogue_v5.csv"
 MY_MOVIES_FILE = DATA_DIR / "my_movies.csv"   # optional: films YOU add (title, language, release_date, poster)
 POSTER_DIR = ROOT / "posters"                 # optional: poster image files for my_movies.csv
 LIVE_TTL = 12 * 3600
+PINNED_TITLES = ["Brindavihari", "Om"]   # always shown in the main grid when they have a poster
+UPCOMING_DAYS = 30        # See more: films opening within this many days
+MORE_DAYS = 14            # See more: language rows look back this far
+RECENT_DAYS = 21          # a film counts as "running now" for this many days after release
+TOP_FILMS = 10            # size of the main Latest releases grid
 MAIN_LANGUAGES = ["Kannada", "Hindi", "Telugu", "Tamil"]
 HOME_LANGUAGE_ORDER = ["Kannada", "Hindi", "Telugu", "Tamil", "Malayalam", "Bengali", "Marathi", "Punjabi",
                        "Gujarati", "Odia", "Assamese", "Bhojpuri", "Tulu", "Konkani", "Haryanvi", "Rajasthani"]
@@ -776,8 +781,8 @@ def movie_info(row: dict) -> dict:
 # 5. POSTERS (Wikipedia / Wikimedia API, cached to CSV)
 # =========================================================
 POSTER_COLS = ["key", "title", "year", "poster_url", "wiki_title", "status", "checked_ts", "source", "trailer_tried"]
-NOT_FOUND_TTL = 7 * 24 * 3600   # retry "not found" after a week
-ERROR_TTL = 3600                # retry network errors after an hour
+NOT_FOUND_TTL = 24 * 3600   # retry "not found" after a week
+ERROR_TTL = 300                # retry network errors after an hour
 
 
 def poster_key(title, year) -> str:
@@ -790,9 +795,8 @@ def _wiki_search(query: str) -> list[dict]:
         "gsrlimit": 6, "gsrnamespace": 0, "prop": "pageimages|extracts", "piprop": "thumbnail",
         "pithumbsize": 800, "exintro": 1, "explaintext": 1, "exsentences": 3, "exlimit": "max",
     }
-    resp = requests.get(WIKI_API, params=params, headers=HTTP_HEADERS, timeout=12)
-    resp.raise_for_status()
-    pages = resp.json().get("query", {}).get("pages", {})
+    data = wiki_get(params, timeout=20)
+    pages = data.get("query", {}).get("pages", {})
     return sorted(pages.values(), key=lambda p: p.get("index", 99))
 
 
@@ -903,7 +907,7 @@ except Exception:  # noqa: BLE001
 
 
 def portrait_ok(url: str) -> bool:
-    """True only for sharp, portrait, poster-shaped images (at least 340 px wide, height 1.35 to 1.7 times the width).
+    """True only for sharp, portrait, poster-shaped images (at least 300 px wide, height 1.25 to 1.85 times the width).
     Wide banners, trailer frames, tiny/blurry images and posters you rejected are not used."""
     if str(url).startswith("data:image/"):
         return True
@@ -920,7 +924,7 @@ def portrait_ok(url: str) -> bool:
                 got += len(chunk)
                 if parser.image is not None:
                     w, h = parser.image.size
-                    return w >= 340 and 1.35 <= h / w <= 1.7
+                    return w >= 300 and 1.25 <= h / w <= 1.85
                 if got > 600_000:
                     break
     except Exception:  # noqa: BLE001 - could not measure: do not punish the film
@@ -938,7 +942,7 @@ def wiki_poster_candidates(title: str, year):
                 if _valid_film_page(page, title, year):
                     out.append((page["thumbnail"]["source"], page.get("title", "")))
         return out, ("found" if out else "not_found")
-    except requests.RequestException:
+    except (requests.RequestException, RuntimeError, ValueError):
         return out, "error"
 
 
@@ -992,7 +996,7 @@ def get_posters(items: list[tuple]) -> dict:
         todo.append((title, year, key, page_url, preset))
 
     if todo:
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             outcomes = list(pool.map(lambda it: lookup_poster(it[0], it[1], it[3], it[4]), todo))
         for (title, year, key, _, _), (url, label, status, source) in zip(todo, outcomes):
             cache[key] = {"key": key, "title": title, "year": year or "", "poster_url": url, "wiki_title": label,
@@ -1013,7 +1017,8 @@ def get_posters(items: list[tuple]) -> dict:
 
 
 def poster_block(title: str, url: str, badge: bool = False) -> str:
-    badge_html = '<span class="badge-today">OUT TODAY</span>' if badge else ""
+    label = badge if isinstance(badge, str) else ("OUT TODAY" if badge else "")
+    badge_html = f'<span class="badge-today">{safe(label)}</span>' if label else ""
     safe_link = url if str(url).startswith("data:image/") else safe_url(url).replace("'", "%27")
     if safe_link:
         return (f'<div class="mc-poster" role="img" aria-label="Poster of {safe(title)}">'
@@ -1652,7 +1657,7 @@ REJECT_WORDS = {"trailer", "teaser", "song", "songs", "jukebox", "lyrical", "sho
 SEQUEL_WORDS = {"chapter", "part", "ii", "iii", "iv", "returns", "reloaded", "begins", "rising", "legacy"}
 
 
-def video_matches_movie(video_title: str, movie: str, release_ts, published_at: str) -> bool:
+def video_matches_movie(video_title: str, movie: str, release_ts, published_at: str, relaxed: bool = False) -> bool:
     """Strict title matching to avoid unrelated videos and sequel/original mix-ups."""
     tokens = re.findall(r"[a-z0-9]+", video_title.lower())
     target = re.findall(r"[a-z0-9]+", re.sub(r"\([^)]*\)", " ", movie.lower()))
@@ -1665,30 +1670,33 @@ def video_matches_movie(video_title: str, movie: str, release_ts, published_at: 
     nxt = tokens[pos + n] if pos + n < len(tokens) else ""
     if nxt and (nxt.isdigit() or nxt in SEQUEL_WORDS) and not target[-1].isdigit():
         return False  # e.g. searching "Jailer" must not match "Jailer 2 review"
-    if not REVIEW_WORDS & set(tokens) or REJECT_WORDS & set(tokens):
+    if relaxed:      # second pass: reactions / trailers are fine, songs and shorts are not
+        if {"song", "songs", "jukebox", "lyrical", "shorts"} & set(tokens):
+            return False
+    elif not REVIEW_WORDS & set(tokens) or REJECT_WORDS & set(tokens):
         return False
     years = {int(t) for t in tokens if re.fullmatch(r"20\d\d", t)}
     if pd.notna(release_ts) and years and release_ts.year not in years and not (years & {release_ts.year - 1, release_ts.year + 1}):
         return False
     if pd.notna(release_ts) and published_at:
         pub = pd.to_datetime(published_at, errors="coerce", utc=True)
-        if pd.notna(pub) and pub.tz_localize(None) < release_ts - timedelta(days=14):
+        if pd.notna(pub) and pub.tz_localize(None) < release_ts - timedelta(days=180 if relaxed else 14):
             return False  # video is older than the film's release window
     return True
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def yt_search_videos(movie: str, release_iso: str, _api_key: str) -> list[dict]:
+def yt_search_videos(movie: str, release_iso: str, _api_key: str, language: str = "", relaxed: bool = False) -> list[dict]:
     release_ts = pd.to_datetime(release_iso, errors="coerce") if release_iso else pd.NaT
     year = f" {release_ts.year}" if pd.notna(release_ts) else ""
-    data = _yt_get("search", {"part": "snippet", "q": f"{movie}{year} movie review", "type": "video",
+    data = _yt_get("search", {"part": "snippet", "q": " ".join(x for x in [movie, language.split(",")[0].strip(), "movie" if relaxed else "movie review", year.strip()] if x), "type": "video",
                               "regionCode": "IN", "order": "relevance", "maxResults": 25, "key": _api_key})
     videos, seen = [], set()
     for item in data.get("items", []):
         snip, vid = item.get("snippet", {}), item.get("id", {}).get("videoId")
         if not vid or vid in seen:
             continue
-        if not video_matches_movie(snip.get("title", ""), movie, release_ts, snip.get("publishedAt", "")):
+        if not video_matches_movie(snip.get("title", ""), movie, release_ts, snip.get("publishedAt", ""), relaxed):
             continue
         seen.add(vid)
         videos.append({"video_id": vid, "title": html.unescape(snip.get("title", "")),
@@ -1726,16 +1734,25 @@ def yt_fetch_comments(video_id: str, max_comments: int, _api_key: str):
     return comments, "ok"
 
 
-def auto_collect_comments(title: str, release_ts):
+def search_videos_smart(movie: str, release_ts, language: str, key: str):
+    """Review videos first; if none match, reaction/trailer videos about the same film."""
+    iso = release_ts.isoformat() if pd.notna(release_ts) else ""
+    vids = yt_search_videos(movie, iso, key, language, False)
+    if vids:
+        return vids, "review videos"
+    return yt_search_videos(movie, iso, key, language, True), "reaction/trailer videos"
+
+
+def auto_collect_comments(title: str, release_ts, language: str = ""):
     """One-click collection for a film: find review videos, fetch comments, save to CSV.
     Returns (status, message). status: ok | no_key | no_videos | no_comments | error."""
     key = get_youtube_key()
     if not key:
         return "no_key", "No API key is configured."
     try:
-        videos = yt_search_videos(title, release_ts.isoformat() if pd.notna(release_ts) else "", key)
+        videos, kind = search_videos_smart(title, release_ts, language, key)
         if not videos:
-            return "no_videos", "No review videos matching this exact title were found on YouTube yet."
+            return "no_videos", "No videos matching this exact title were found yet (searched reviews, then reactions and trailers)."
         rows = []
         for vid in videos[:3]:
             try:
@@ -1752,7 +1769,7 @@ def auto_collect_comments(title: str, release_ts):
         if not rows:
             return "no_comments", "Review videos exist, but they have no public comments (or comments are disabled)."
         save_collected(pd.DataFrame(rows))
-        return "ok", f"{len(rows)} comments collected."
+        return "ok", f"{len(rows)} comments collected from {kind}."
     except YouTubeError as exc:
         return "error", explain_youtube_error(exc)
     except requests.RequestException as exc:
@@ -1845,10 +1862,10 @@ def render_movie_grid(df: pd.DataFrame, prefix: str, per_row: int = 4):
             info = movie_info(rec)
             ts = rec["release_date"]
             url = posters.get(poster_key(info["title"], info["year"]), "")
-            is_today = pd.notna(ts) and ts.date() == TODAY
+            badge_label = "OUT TODAY" if (pd.notna(ts) and ts.date() == TODAY) else ("COMING SOON" if (pd.notna(ts) and ts.date() > TODAY) else "")
             meta = " · ".join(x for x in [info["language"], fmt_date(ts)] if x)
             with cols[offset]:
-                md_html(poster_block(info["title"], url, badge=is_today)
+                md_html(poster_block(info["title"], url, badge=badge_label)
                         + f'<div class="mc-title">{safe(info["title"])}</div><div class="mc-meta">{safe(meta)}</div>')
                 st.button("Analyse sentiment", key=f"{prefix}_{start + offset}", on_click=cb_select, args=(info,))
 
@@ -1857,14 +1874,14 @@ def cb_retry_collect(k):
     st.session_state.auto_attempts.pop(k, None)
 
 
-def render_movie_analysis(title: str, prefix: str, release_ts=None):
+def render_movie_analysis(title: str, prefix: str, release_ts=None, language: str = ""):
     sub = comments_for_movie(corpus, title)
     if sub.empty:
         attempts = st.session_state.setdefault("auto_attempts", {})
         k = movie_key(title)
         if k not in attempts or (attempts[k][0] == "no_key" and get_youtube_key()):
             with st.spinner("Loading audience response..."):
-                attempts[k] = auto_collect_comments(title, release_ts)
+                attempts[k] = auto_collect_comments(title, release_ts, language)
             if attempts[k][0] == "ok":
                 st.rerun()
         status = attempts[k][0]
@@ -1873,6 +1890,8 @@ def render_movie_analysis(title: str, prefix: str, release_ts=None):
             status, "There are no public viewer comments for this film yet. Check back after more people have watched it.")
         md_html(f'<div class="card"><h4>Audience response</h4><div class="small">{safe(text)}</div></div>')
         st.button("Try again", key=f"{prefix}_retry", on_click=cb_retry_collect, args=(k,))
+        if ADMIN and status not in ("no_key", "error"):
+            st.caption(f"Owner view: {attempts[k][1]}")
         if ADMIN and status in ("no_key", "error"):
             with st.expander("Owner view: setup note", expanded=True):
                 render_key_doctor(prefix, attempts[k][1])
@@ -1934,7 +1953,7 @@ def render_selected_panel(prefix: str, offer_explorer: bool):
                 else:
                     st.success("Poster saved. It now appears on the cards. Press R or refresh the page to see it.")
     st.markdown("---")
-    render_movie_analysis(sel["title"], prefix, sel["date"])
+    render_movie_analysis(sel["title"], prefix, sel["date"], sel["language"])
     st.markdown("---")
 
 
@@ -1984,23 +2003,38 @@ if page == "Home":
             st.write("Owner view: CineSense needs an internet connection to read releases. Add films by hand in data/my_movies.csv if needed.")
             st.write(catalogue_meta)
     else:
-        released = catalogue[catalogue["release_date"].notna() & (catalogue["release_date"].dt.date <= TODAY)].copy()
+        released = catalogue[catalogue["release_date"].notna()
+                             & (catalogue["release_date"].dt.date <= TODAY + timedelta(days=UPCOMING_DAYS))].copy()   # includes upcoming openings
         released["is_today"] = released["release_date"].dt.date == TODAY
-        released = released.sort_values(["is_today", "release_date", "title"], ascending=[False, False, True])
+        released["is_upcoming"] = released["release_date"].dt.date > TODAY
+        released = released.sort_values(["is_today", "is_upcoming", "release_date", "title"], ascending=[False, True, False, True])
         released["primary"] = released["language"].str.split(",").str[0].str.strip().str.title().replace("", "Other")
-        newest = released["release_date"].max()
+        newest = released.loc[~released["is_upcoming"], "release_date"].max()
         if ADMIN:
             st.button("Refresh releases", key="home_refresh", on_click=cb_refresh_catalogue)
         if pd.notna(newest) and (TODAY - newest.date()).days > 14:
             st.warning(f"The newest release in the data is {fmt_date(newest)}, so very recent films may be missing. "
                        "The list refreshes automatically.")
 
-        cutoff = TODAY - timedelta(days=30)
+        cutoff = TODAY - timedelta(days=RECENT_DAYS)
         hidden = load_hidden()
         released = released[~released["key"].isin(hidden)]
-        pool = released[released["release_date"].dt.date >= cutoff]
+        pool = released[(released["release_date"].dt.date >= cutoff) & (released["release_date"].dt.date <= TODAY + timedelta(days=7))]
         if pool.empty:
             pool = released.head(30)
+
+        # films you always want on the main grid (looked up by title in the whole catalogue)
+        pinned_parts = []
+        for t in PINNED_TITLES:
+            m = catalogue[(catalogue["key"] == movie_key(t)) & catalogue["release_date"].notna()
+                          & (catalogue["release_date"].dt.date <= TODAY + timedelta(days=UPCOMING_DAYS))]
+            if not m.empty:
+                r = m.sort_values("release_date", ascending=False).iloc[[0]].copy()
+                r["is_today"] = r["release_date"].dt.date == TODAY
+                r["is_upcoming"] = r["release_date"].dt.date > TODAY
+                r["primary"] = r["language"].str.split(",").str[0].str.strip().str.title().replace("", "Other")
+                pinned_parts.append(r)
+        pinned = pd.concat(pinned_parts) if pinned_parts else pool.head(0)
 
         def keep_with_poster(frame, posters):
             keep = [bool(posters.get(poster_key(t, int(y) if pd.notna(y) else None)))
@@ -2014,30 +2048,60 @@ if page == "Home":
         language_order = list(MAIN_LANGUAGES) + [l for l in HOME_LANGUAGE_ORDER if l not in MAIN_LANGUAGES]
         language_order += sorted(set(pool["primary"]) - set(language_order))
         candidates = [pool.head(40)] + [pool[pool["primary"] == lang].head(8) for lang in language_order]
-        candidates = pd.concat(candidates).drop_duplicates(["key", "year"])
+        candidates = pd.concat(candidates + [pinned]).drop_duplicates(["key", "year"])
         with st.spinner("Loading the latest releases and their posters..."):
             posters = get_posters(poster_items(candidates))
 
         # 1) Latest releases, all languages together: only films with a real poster
-        top = keep_with_poster(pool.head(40), posters).head(12)
+        by_lang = {lang: keep_with_poster(pool[pool["primary"] == lang], posters) for lang in language_order}
+        mix, used = [], set()
+
+        def take(r):
+            k = (r["key"], r["year"])
+            if k not in used:
+                used.add(k)
+                mix.append(r)
+
+        for _, r in keep_with_poster(pinned, posters).iterrows():
+            take(r)
+        for lang, need in {"Kannada": 2, "Malayalam": 1}.items():        # keep these languages visible (posters only)
+            for _, r in by_lang.get(lang, pool.head(0)).head(need).iterrows():
+                take(r)
+        rank = 0
+        while len(mix) < TOP_FILMS and any(len(g) > rank for g in by_lang.values()):
+            for lang in language_order:                                  # newest film of every language, then the next...
+                g = by_lang[lang]
+                if len(g) > rank and len(mix) < TOP_FILMS:
+                    take(g.iloc[rank])
+            rank += 1
+        top = (pd.DataFrame(mix).sort_values(["is_today", "is_upcoming", "release_date", "title"], ascending=[False, True, False, True])
+               if mix else pool.head(0))
         st.markdown("## Latest releases")
-        st.caption("Films released in the last 30 days, newest first.")
+        st.caption("Now showing and opening this week, from every language.")
         if top.empty:
             st.info("The latest posters are still loading. Please refresh the page in a moment.")
         else:
-            render_movie_grid(top, "home_top")
+            render_movie_grid(top, "home_top", per_row=5)
 
-        # See more: reveals the language rows (at least 2 films with posters each, otherwise the language is left out)
+        # See more: more recent films (posters only), one list, not split by language
         if st.session_state.get("home_extra", 0) == 0:
             st.button("See more", key="home_see_more", on_click=cb_see_more)
         else:
-            st.markdown("## Browse by language")
-            for lang in language_order:
-                rows = keep_with_poster(pool[pool["primary"] == lang], posters).head(4)
-                if len(rows) < 2:
-                    continue
-                st.markdown(f"### {lang}")
-                render_movie_grid(rows, f"home_{lang}")
+            st.markdown("## More new releases")
+            top_keys = set(zip(top["key"], top["year"])) if not top.empty else set()
+            not_in_top = lambda f: f[[(k, y) not in top_keys for k, y in zip(f["key"], f["year"])]]
+            recent_more = not_in_top(released[(released["release_date"].dt.date >= TODAY - timedelta(days=MORE_DAYS))
+                                              & (released["release_date"].dt.date <= TODAY)]).head(30)
+            next_up = not_in_top(released[released["release_date"].dt.date > TODAY].sort_values("release_date")).head(30)
+            with st.spinner("Loading more films..."):
+                posters_more = get_posters(poster_items(pd.concat([recent_more, next_up])))
+            recent_show = keep_with_poster(recent_more, posters_more).head(10)       # newest first
+            next_show = keep_with_poster(next_up, posters_more).head(10)              # soonest first
+            more = pd.concat([recent_show, next_show])
+            if more.empty:
+                st.info("No more films with posters are available right now.")
+            else:
+                render_movie_grid(more, "home_more", per_row=5)
             st.button("Show less", key="home_show_less", on_click=cb_show_less)
 
         if ADMIN:
@@ -2230,7 +2294,7 @@ elif page == "Movie Explorer":
 elif page == "Viewer Reviews":
     page_heading("Viewer Reviews", "Public viewer comments on movie-review videos, analysed with the NLP models.")
     md_html('<div class="card"><h4>What this page shows</h4><div class="small">These are <b>public comments left on '
-            "online movie-review videos</b>, collected through the YouTube Data API. They are not verified reviews "
+            "online videos about the film (reviews, reactions and trailers)</b>, collected through the YouTube Data API. They are not verified reviews "
             "and do not represent everyone who watched the film. Nothing here is generated or sample data.</div></div>")
 
     api_key = get_youtube_key()
@@ -2264,7 +2328,7 @@ elif page == "Viewer Reviews":
                 rows, notes, vids = [], [], []
                 try:
                     with st.spinner("Fetching comments..."):
-                        vids = yt_search_videos(name, release_ts.isoformat() if pd.notna(release_ts) else "", api_key)
+                        vids, _kind = search_videos_smart(name, release_ts, str(matched["language"]) if matched is not None else "", api_key)
                         if not vids:
                             notes.append("No matching comments were found. Try the exact film title and check the spelling.")
                         for vid in vids[:3]:
@@ -2345,7 +2409,7 @@ elif page == "About":
 
     st.markdown("## How the pipeline works")
     steps = [
-        ("Collect", "Public comments are fetched from selected YouTube review videos with the YouTube Data API v3. "
+        ("Collect", "Public comments are fetched from videos about the film (reviews, reactions, trailers) with the YouTube Data API v3. "
                     "Existing CSV files in the data folder are loaded too and duplicates removed."),
         ("Pre-process", "HTML tags are removed, links become “http”, @mentions become “@user”, extra spaces are trimmed and "
                         "very long text is cut at 1,000 characters. Emojis are kept because they carry sentiment."),
