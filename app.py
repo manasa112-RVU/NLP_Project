@@ -305,6 +305,9 @@ LIVE_CATALOGUE_FILE = DATA_DIR / "live_catalogue_v5.csv"
 MY_MOVIES_FILE = DATA_DIR / "my_movies.csv"   # optional: films YOU add (title, language, release_date, poster)
 POSTER_DIR = ROOT / "posters"                 # optional: poster image files for my_movies.csv
 LIVE_TTL = 12 * 3600
+MIN_COMMENTS = 15          # a released film appears on Home only if it has at least this many audience comments
+MAX_NEW_CHECKS = 8        # films checked for comments per Home load (each costs ~100 YouTube quota units)
+MIN_GRID = 6              # never leave the main grid with fewer films than this
 PINNED_TITLES = ["Brindavihari", "Om"]   # always shown in the main grid when they have a poster
 UPCOMING_DAYS = 30        # See more: films opening within this many days
 MORE_DAYS = 14            # See more: language rows look back this far
@@ -1743,14 +1746,17 @@ def search_videos_smart(movie: str, release_ts, language: str, key: str):
     return yt_search_videos(movie, iso, key, language, True), "reaction/trailer videos"
 
 
-def auto_collect_comments(title: str, release_ts, language: str = ""):
+def auto_collect_comments(title: str, release_ts, language: str = "", strict_only: bool = False):
     """One-click collection for a film: find review videos, fetch comments, save to CSV.
     Returns (status, message). status: ok | no_key | no_videos | no_comments | error."""
     key = get_youtube_key()
     if not key:
         return "no_key", "No API key is configured."
     try:
-        videos, kind = search_videos_smart(title, release_ts, language, key)
+        if strict_only:
+            videos, kind = yt_search_videos(title, release_ts.isoformat() if pd.notna(release_ts) else "", key, language, False), "review videos"
+        else:
+            videos, kind = search_videos_smart(title, release_ts, language, key)
         if not videos:
             return "no_videos", "No videos matching this exact title were found yet (searched reviews, then reactions and trailers)."
         rows = []
@@ -1774,6 +1780,38 @@ def auto_collect_comments(title: str, release_ts, language: str = ""):
         return "error", explain_youtube_error(exc)
     except requests.RequestException as exc:
         return "error", f"Network problem while contacting YouTube: {exc}"
+
+
+ATTEMPTS_FILE = DATA_DIR / "comment_attempts.csv"
+
+
+def load_attempts() -> dict:
+    df = read_csv_any(ATTEMPTS_FILE)
+    if df.empty or not {"key", "checked_ts"} <= set(df.columns):
+        return {}
+    return {str(r["key"]): float(r["checked_ts"]) for r in df.to_dict("records")}
+
+
+def prefetch_comments(frame: pd.DataFrame, counts: dict) -> bool:
+    """Collect comments for a few released films that have none saved yet, so Home can show only films people discuss.
+    Returns True when new comments were saved."""
+    if not get_youtube_key():
+        return False
+    attempts, now, saved = load_attempts(), time.time(), False
+    todo = [r for r in frame.to_dict("records")
+            if counts.get(r["key"], 0) < MIN_COMMENTS and now - attempts.get(r["key"], 0) > 12 * 3600][:MAX_NEW_CHECKS]
+    for r in todo:
+        status, _ = auto_collect_comments(r["title"], r["release_date"], r["language"], strict_only=True)
+        if status == "error":                    # quota or network problem: stop and retry later
+            break
+        attempts[r["key"]] = now
+        saved = saved or status == "ok"
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        pd.DataFrame({"key": list(attempts), "checked_ts": list(attempts.values())}).to_csv(ATTEMPTS_FILE, index=False)
+    except OSError:
+        pass
+    return saved
 
 
 def save_collected(df: pd.DataFrame) -> int:
@@ -2039,7 +2077,7 @@ if page == "Home":
         def keep_with_poster(frame, posters):
             keep = [bool(posters.get(poster_key(t, int(y) if pd.notna(y) else None)))
                     for t, y in zip(frame["title"], frame["year"])]
-            return frame[keep]
+            return frame[np.array(keep, dtype=bool)]
 
         def poster_items(frame):
             return [(r["title"], int(r["year"]) if pd.notna(r["year"]) else None, r["poster_csv"], r.get("page_url", ""))
@@ -2053,7 +2091,21 @@ if page == "Home":
             posters = get_posters(poster_items(candidates))
 
         # 1) Latest releases, all languages together: only films with a real poster
-        by_lang = {lang: keep_with_poster(pool[pool["primary"] == lang], posters) for lang in language_order}
+        counts = corpus.groupby("key").size().to_dict() if not corpus.empty else {}
+        have_key = bool(get_youtube_key())
+        if have_key:                                   # check audience response for a few films not checked before
+            with st.spinner("Checking audience response for the latest films..."):
+                if prefetch_comments(keep_with_poster(pool[~pool["is_upcoming"]], posters), counts):
+                    st.rerun()
+
+        def eligible(frame):
+            """Released films need real audience comments; films opening soon are exempt."""
+            if not have_key:
+                return frame
+            ok = [bool(up) or counts.get(k, 0) >= MIN_COMMENTS for k, up in zip(frame["key"], frame["is_upcoming"])]
+            return frame[np.array(ok, dtype=bool)]
+
+        by_lang = {lang: eligible(keep_with_poster(pool[pool["primary"] == lang], posters)) for lang in language_order}
         mix, used = [], set()
 
         def take(r):
@@ -2074,6 +2126,11 @@ if page == "Home":
                 if len(g) > rank and len(mix) < TOP_FILMS:
                     take(g.iloc[rank])
             rank += 1
+        if len(mix) < MIN_GRID:                                          # not enough discussed films yet: add films with posters
+            for _, r in keep_with_poster(pool, posters).iterrows():
+                if len(mix) >= MIN_GRID:
+                    break
+                take(r)
         top = (pd.DataFrame(mix).sort_values(["is_today", "is_upcoming", "release_date", "title"], ascending=[False, True, False, True])
                if mix else pool.head(0))
         st.markdown("## Latest releases")
@@ -2089,13 +2146,13 @@ if page == "Home":
         else:
             st.markdown("## More new releases")
             top_keys = set(zip(top["key"], top["year"])) if not top.empty else set()
-            not_in_top = lambda f: f[[(k, y) not in top_keys for k, y in zip(f["key"], f["year"])]]
+            not_in_top = lambda f: f[np.array([(k, y) not in top_keys for k, y in zip(f["key"], f["year"])], dtype=bool)]
             recent_more = not_in_top(released[(released["release_date"].dt.date >= TODAY - timedelta(days=MORE_DAYS))
                                               & (released["release_date"].dt.date <= TODAY)]).head(30)
             next_up = not_in_top(released[released["release_date"].dt.date > TODAY].sort_values("release_date")).head(30)
             with st.spinner("Loading more films..."):
                 posters_more = get_posters(poster_items(pd.concat([recent_more, next_up])))
-            recent_show = keep_with_poster(recent_more, posters_more).head(10)       # newest first
+            recent_show = eligible(keep_with_poster(recent_more, posters_more)).head(10)       # newest first
             next_show = keep_with_poster(next_up, posters_more).head(10)              # soonest first
             more = pd.concat([recent_show, next_show])
             if more.empty:
