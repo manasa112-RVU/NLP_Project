@@ -308,7 +308,7 @@ LIVE_TTL = 12 * 3600
 MIN_COMMENTS = 15          # a released film appears on Home only if it has at least this many audience comments
 MAX_NEW_CHECKS = 8        # films checked for comments per Home load (each costs ~100 YouTube quota units)
 MIN_GRID = 6              # never leave the main grid with fewer films than this
-PINNED_TITLES = ["Brindavihari", "Om"]   # always shown in the main grid when they have a poster
+PINNED_TITLES = ["Brindavihari", "Om", "OM - Operation Mole"]   # always shown in the main grid when they have a poster
 UPCOMING_DAYS = 30        # See more: films opening within this many days
 MORE_DAYS = 14            # See more: language rows look back this far
 RECENT_DAYS = 21          # a film counts as "running now" for this many days after release
@@ -2320,11 +2320,23 @@ elif page == "Movie Explorer":
         st.warning("The movie catalogue is missing or has no title column (data/released_indian_movies.csv).")
     else:
         languages = sorted({t.strip().title() for v in catalogue["language"] for t in re.split(r"[,/&;]| and ", v) if t.strip()})
-        f1, f2, f3, f4 = st.columns([3, 2, 2, 1])
+        f1, f2, f3 = st.columns([3, 2, 2])
         query = f1.text_input("Search by movie name", placeholder="Type a movie name...")
         lang = f2.selectbox("Language", ["All languages"] + languages)
         order = f3.selectbox("Sort by", ["Newest first", "A to Z"])
-        upcoming = f4.checkbox("Include upcoming", value=False)
+        c1, c2 = st.columns(2)
+        upcoming = c1.checkbox("Include upcoming", value=False)
+        reviewed_only = c2.checkbox("Only films with audience reviews", value=True)
+
+        counts = corpus.groupby("key").size().to_dict() if not corpus.empty else {}
+        have_key = bool(get_youtube_key())
+        if reviewed_only and have_key and not query.strip():        # each visit checks a few more recent films
+            recent = catalogue[catalogue["release_date"].notna() & (catalogue["release_date"].dt.date <= TODAY)
+                               & (catalogue["release_date"].dt.date >= TODAY - timedelta(days=90))]
+            recent = recent[~recent["key"].isin(load_hidden())].sort_values("release_date", ascending=False)
+            with st.spinner("Checking audience reviews for recent films..."):
+                if prefetch_comments(recent.head(40), counts):
+                    st.rerun()
 
         df = catalogue.copy()
         if not upcoming:
@@ -2333,15 +2345,26 @@ elif page == "Movie Explorer":
             df = df[df["title"].str.contains(re.escape(query.strip()), case=False, na=False)]
         if lang != "All languages":
             df = df[df["language"].str.contains(re.escape(lang), case=False, na=False)]
+        if reviewed_only and have_key and not query.strip():          # searching by name always looks at every film
+            df = df[np.array([counts.get(k, 0) >= MIN_COMMENTS for k in df["key"]], dtype=bool)]
         df = df.sort_values("title") if order == "A to Z" else df.sort_values(["release_date", "title"], ascending=[False, True], na_position="last")
+        if reviewed_only and have_key and not query.strip() and not df.empty:      # browsing view: only films that also have a poster
+            head = df.head(120)
+            with st.spinner("Loading posters..."):
+                pst = get_posters([(r["title"], int(r["year"]) if pd.notna(r["year"]) else None, r["poster_csv"], r.get("page_url", ""))
+                                   for r in head.to_dict("records")])
+            df = head[np.array([bool(pst.get(poster_key(t, int(y) if pd.notna(y) else None)))
+                                for t, y in zip(head["title"], head["year"])], dtype=bool)]
 
         if df.empty:
-            st.info("No movies match these filters. Clear the search or choose another language.")
+            st.info("No films match yet. Untick “Only films with audience reviews”, search by name, or refresh in a minute "
+                    "while more recent films are checked.")
         else:
             per_page = 12
             pages = max(1, -(-len(df) // per_page))
             page_no = st.number_input(f"Page (1 to {pages})", 1, pages, 1) if pages > 1 else 1
-            st.caption(f"{len(df):,} movies match.")
+            st.caption(f"{len(df):,} films. " + ("Showing films that have audience reviews and a poster; untick the box or search by name to see every film."
+                                                  if reviewed_only and not query.strip() else ""))
             render_movie_grid(df.iloc[(page_no - 1) * per_page: page_no * per_page], "exp")
 
 
