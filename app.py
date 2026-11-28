@@ -11,6 +11,7 @@ Pipeline (see the About page for the full explanation):
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import html
 import os
@@ -302,6 +303,7 @@ def _build_catalogue(stamp: int):
 
 # ---- live catalogue: films released now, from Wikipedia year/language categories ----
 LIVE_CATALOGUE_FILE = DATA_DIR / "live_catalogue_v5.csv"
+THIS_WEEK_FILE = DATA_DIR / "this_week.csv"   # your list of this week's releases: title, language, release_date[, poster]
 MY_MOVIES_FILE = DATA_DIR / "my_movies.csv"   # optional: films YOU add (title, language, release_date, poster)
 POSTER_DIR = ROOT / "posters"                 # optional: poster image files for my_movies.csv
 LIVE_TTL = 12 * 3600
@@ -310,7 +312,7 @@ MAX_NEW_CHECKS = 8        # films checked for comments per Home load (each costs
 MIN_GRID = 6              # never leave the main grid with fewer films than this
 PINNED_TITLES = ["Brindavihari", "Om", "OM - Operation Mole"]   # always shown in the main grid when they have a poster
 UPCOMING_DAYS = 30        # See more: films opening within this many days
-MORE_DAYS = 14            # See more: language rows look back this far
+MORE_DAYS = 30            # See more: language rows look back this far
 RECENT_DAYS = 21          # a film counts as "running now" for this many days after release
 TOP_FILMS = 10            # size of the main Latest releases grid
 MAIN_LANGUAGES = ["Kannada", "Hindi", "Telugu", "Tamil"]
@@ -618,8 +620,8 @@ def cb_refresh_catalogue():
 
 
 @st.cache_data(show_spinner=False)
-def _load_my_movies(stamp: int):
-    raw = read_csv_any(MY_MOVIES_FILE)
+def _load_my_movies(stamp: int, path_str: str = ""):
+    raw = read_csv_any(Path(path_str) if path_str else MY_MOVIES_FILE)
     if raw.empty:
         return pd.DataFrame()
     t = find_column(raw, ["title", "movie", "name"])
@@ -738,6 +740,10 @@ def load_catalogue():
     if not mine.empty:
         frames.append(mine)
         meta["my_movies_rows"] = len(mine)
+    week = _load_my_movies(file_stamp(THIS_WEEK_FILE), str(THIS_WEEK_FILE))
+    if not week.empty:
+        frames.append(week)
+        meta["featured_keys"] = set(week["title"].map(movie_key))
     if not calendar.empty:
         frames.append(pd.DataFrame({
             "title": calendar["title"].astype(str), "language": calendar["language"].fillna("").astype(str),
@@ -1430,15 +1436,7 @@ def comment_card(item: dict) -> str:
         ts = pd.to_datetime(item["published_at"], errors="coerce", utc=True)
         date_txt = ts.strftime("%d %b %Y") if pd.notna(ts) else ""
     meta = " · ".join(x for x in [date_txt, f"{int(item['likes'])} likes" if str(item.get("likes", "")).strip() not in ("", "nan") and str(item.get("likes")).replace(".0", "").isdigit() else ""] if x)
-    link = safe_url(item.get("comment_url") or item.get("video_url"))
     src = ""
-    if item.get("video_title"):
-        title_html = safe(item["video_title"])
-        src = f'Source: <a href="{link}" target="_blank" rel="noopener">{title_html}</a>' if link else f"Source: {title_html}"
-        if item.get("channel"):
-            src += f" · {safe(item['channel'])}"
-    elif link:
-        src = f'<a href="{link}" target="_blank" rel="noopener">Source link</a>'
     reason = f'<div class="cm-src">Why: {safe(item["reason"])}</div>' if item.get("reason") else ""
     return (f'<div class="cm"><div class="cm-top"><span class="pill pill-{item["sentiment"]}">{item["sentiment"]}</span>'
             f'<span class="small">Score {float(item["score"]):.0f}% · {safe(item["model_route"])}</span>'
@@ -1606,6 +1604,11 @@ def _yt_get(endpoint: str, params: dict) -> dict:
     reasons = [e.get("reason") for e in err.get("errors", []) if isinstance(e, dict)]
     reasons += [d.get("reason") for d in err.get("details", []) if isinstance(d, dict)]
     raise YouTubeError(reasons, err.get("message", resp.text[:200]), resp.status_code)
+
+
+def friendly_error(exc) -> str:
+    """Visitors see a neutral message; the owner (?admin=1) sees the technical reason."""
+    return explain_youtube_error(exc) if ADMIN else "Comments are temporarily unavailable. Please try again in a moment."
 
 
 def explain_youtube_error(exc) -> str:
@@ -1792,16 +1795,16 @@ def load_attempts() -> dict:
     return {str(r["key"]): float(r["checked_ts"]) for r in df.to_dict("records")}
 
 
-def prefetch_comments(frame: pd.DataFrame, counts: dict) -> bool:
+def prefetch_comments(frame: pd.DataFrame, counts: dict, strict_only: bool = True, limit: int = 0) -> bool:
     """Collect comments for a few released films that have none saved yet, so Home can show only films people discuss.
     Returns True when new comments were saved."""
     if not get_youtube_key():
         return False
     attempts, now, saved = load_attempts(), time.time(), False
     todo = [r for r in frame.to_dict("records")
-            if counts.get(r["key"], 0) < MIN_COMMENTS and now - attempts.get(r["key"], 0) > 12 * 3600][:MAX_NEW_CHECKS]
+            if counts.get(r["key"], 0) < MIN_COMMENTS and now - attempts.get(r["key"], 0) > 12 * 3600][:(limit or MAX_NEW_CHECKS)]
     for r in todo:
-        status, _ = auto_collect_comments(r["title"], r["release_date"], r["language"], strict_only=True)
+        status, _ = auto_collect_comments(r["title"], r["release_date"], r["language"], strict_only=strict_only)
         if status == "error":                    # quota or network problem: stop and retry later
             break
         attempts[r["key"]] = now
@@ -2018,14 +2021,11 @@ with st.sidebar:
 # 13. PAGE 1 - HOME
 # =========================================================
 if page == "Home":
-    n_movies_c = corpus["key"].nunique() if not corpus.empty else 0
     md_html(f"""
     <div class="hero">
       <div class="hero-title">Every movie has a story.<br>Every audience has a voice.</div>
       <div class="hero-sub">CineSense reads what viewers write about Indian films and classifies each opinion as
       positive, neutral or negative using transformer-based Natural Language Processing.</div>
-      <div class="chips"><span class="chip">{len(corpus):,} comments collected</span>
-      <span class="chip">{n_movies_c:,} movies with comments</span><span class="chip">{len(catalogue):,} movies in the catalogue</span></div>
     </div>""")
 
     render_selected_panel("home", offer_explorer=True)
@@ -2061,6 +2061,11 @@ if page == "Home":
         if pool.empty:
             pool = released.head(30)
 
+        # your "this week" list goes first inside every language
+        featured_keys = catalogue_meta.get("featured_keys", set())
+        featured = released[released["key"].isin(featured_keys)]
+        pool = pd.concat([featured, pool]).drop_duplicates(["key", "year"])
+
         # films you always want on the main grid (looked up by title in the whole catalogue)
         pinned_parts = []
         for t in PINNED_TITLES:
@@ -2095,7 +2100,10 @@ if page == "Home":
         have_key = bool(get_youtube_key())
         if have_key:                                   # check audience response for a few films not checked before
             with st.spinner("Checking audience response for the latest films..."):
-                if prefetch_comments(keep_with_poster(pool[~pool["is_upcoming"]], posters), counts):
+                feat_now = keep_with_poster(featured[~featured["is_upcoming"]], posters)
+                got_feat = prefetch_comments(feat_now, counts, strict_only=False, limit=12)      # full search for your list
+                got_pool = prefetch_comments(keep_with_poster(pool[~pool["is_upcoming"]], posters), counts)
+                if got_feat or got_pool:
                     st.rerun()
 
         def eligible(frame):
@@ -2131,6 +2139,16 @@ if page == "Home":
                 if len(mix) >= MIN_GRID:
                     break
                 take(r)
+        added_new = 0                                                    # two more of the very newest releases
+        newest_out = keep_with_poster(pool[~pool["is_upcoming"]], posters)
+        for source in (eligible(newest_out), newest_out):              # films with comments first, then any with a poster
+            for _, r in source.iterrows():
+                if added_new >= 2:
+                    break
+                if (r["key"], r["year"]) in used:
+                    continue
+                take(r)
+                added_new += 1
         top = (pd.DataFrame(mix).sort_values(["is_today", "is_upcoming", "release_date", "title"], ascending=[False, True, False, True])
                if mix else pool.head(0))
         st.markdown("## Latest releases")
@@ -2152,11 +2170,11 @@ if page == "Home":
             next_up = not_in_top(released[released["release_date"].dt.date > TODAY].sort_values("release_date")).head(30)
             with st.spinner("Loading more films..."):
                 posters_more = get_posters(poster_items(pd.concat([recent_more, next_up])))
-            recent_show = eligible(keep_with_poster(recent_more, posters_more)).head(10)       # newest first
+            recent_show = keep_with_poster(recent_more, posters_more).head(12)       # newest first
             next_show = keep_with_poster(next_up, posters_more).head(10)              # soonest first
             more = pd.concat([recent_show, next_show])
             if more.empty:
-                st.info("No more films with posters are available right now.")
+                st.info("You are all caught up. Every recent film that has a poster is already shown above.")
             else:
                 render_movie_grid(more, "home_more", per_row=5)
             st.button("Show less", key="home_show_less", on_click=cb_show_less)
@@ -2179,7 +2197,7 @@ elif page == "Dashboard":
     else:
         f1, f2 = st.columns(2)
         movies_sel = f1.multiselect("Movies", sorted(corpus["movie"].unique()), placeholder="All movies")
-        sources_sel = f2.multiselect("Data source", sorted(corpus["source"].unique()), placeholder="All sources")
+        sources_sel = f2.multiselect("Data source", sorted(corpus["source"].unique()), placeholder="All sources") if ADMIN else []
         view = corpus
         if movies_sel:
             view = view[view["movie"].isin(movies_sel)]
@@ -2241,7 +2259,7 @@ elif page == "Dashboard":
                         st.download_button("Download movie summary (CSV)", table.to_csv(index=False).encode("utf-8"),
                                            "cinesense_movie_sentiment_summary.csv", "text/csv")
                 with tab3:
-                    show_cols = ["movie", "comment", "sentiment", "score", "model_route", "script", "source"]
+                    show_cols = ["movie", "comment", "sentiment", "score", "model_route", "script"] + (["source"] if ADMIN else [])
                     st.dataframe(data[show_cols], hide_index=True)
                     st.download_button("Download analysed comments (CSV)", data[show_cols].to_csv(index=False).encode("utf-8"),
                                        "cinesense_analysed_comments.csv", "text/csv")
@@ -2372,10 +2390,26 @@ elif page == "Movie Explorer":
 # 17. PAGE 5 - VIEWER REVIEWS (YouTube comments)
 # =========================================================
 elif page == "Viewer Reviews":
-    page_heading("Viewer Reviews", "Public viewer comments on movie-review videos, analysed with the NLP models.")
-    md_html('<div class="card"><h4>What this page shows</h4><div class="small">These are <b>public comments left on '
-            "online videos about the film (reviews, reactions and trailers)</b>, collected through the YouTube Data API. They are not verified reviews "
+    page_heading("Viewer Reviews", "Public viewer comments on recent films, analysed with the NLP models.")
+    md_html('<div class="card"><h4>What this page shows</h4><div class="small">These are <b>public viewer comments about the film</b>, '
+            "collected from public online sources and classified by the NLP models. They are not verified reviews "
             "and do not represent everyone who watched the film. Nothing here is generated or sample data.</div></div>")
+
+    suggestions: list[str] = []
+    # Films that already have saved audience comments: pick one and see the analysis straight away
+    if not corpus.empty:
+        per_film = corpus.groupby("key").agg(movie=("movie", "first"), n=("comment", "size"))
+        per_film = per_film[per_film["n"] >= MIN_COMMENTS].sort_values("n", ascending=False)
+        suggestions = per_film["movie"].head(6).tolist()
+        labels = {f"{r.movie}  ({int(r.n):,} comments)": r.movie for r in per_film.itertuples()}
+        if labels:
+            st.markdown("### Browse films with audience comments")
+            chosen_label = st.selectbox("Choose a film", [""] + list(labels), key="vr_browse",
+                                        format_func=lambda x: x or "Select a film...")
+            if chosen_label:
+                render_movie_analysis(labels[chosen_label], "vrb")
+            st.markdown("---")
+    st.markdown("### Can't find your film in the list? Search for it")
 
     api_key = get_youtube_key()
     if not api_key:
@@ -2384,10 +2418,7 @@ elif page == "Viewer Reviews":
             with st.expander("Owner view: setup note"):
                 render_key_doctor("vr")
     else:
-        recent_titles = [""] + (catalogue[catalogue["release_date"].dt.date <= TODAY].sort_values("release_date", ascending=False)["title"].head(60).tolist() if not catalogue.empty else [])
-        st.selectbox("Pick a recent release (optional)", recent_titles, key="yt_pick",
-                     on_change=lambda: st.session_state.update(yt_movie=st.session_state.yt_pick) if st.session_state.yt_pick else None)
-        movie_name = st.text_input("Movie name", key="yt_movie", placeholder="e.g. Kantara Chapter 1")
+        movie_name = st.text_input("Search for a film", key="yt_movie", placeholder="Type a film name, e.g. Kantara Chapter 1")
 
         release_ts, matched = pd.NaT, None
         if movie_name.strip() and not catalogue.empty:
@@ -2399,28 +2430,37 @@ elif page == "Viewer Reviews":
             st.caption(f"Matched to catalogue: {matched['title']} · {matched['language'] or 'language n/a'} · "
                        f"released {fmt_date(release_ts) or 'date n/a'}. Videos older than the release window are ignored.")
 
-        per_video = st.selectbox("Maximum comments per video", [20, 50, 100, 200], index=1)
+        per_video = st.selectbox("Maximum comments to fetch per source", [20, 50, 100, 200], index=1)
+        if movie_name.strip() and not corpus.empty:
+            saved_names = {m.lower(): m for m in corpus["movie"].unique()}
+            hit = difflib.get_close_matches(movie_name.strip().lower(), list(saved_names), n=1, cutoff=0.72)
+            if hit and int((corpus["key"] == movie_key(saved_names[hit[0]])).sum()) >= 1:
+                st.caption(f"Saved audience comments found for “{saved_names[hit[0]]}”.")
+                render_movie_analysis(saved_names[hit[0]], "vrs")
+                st.markdown("---")
         if st.button("Fetch comments", key="yt_fetch"):
             name = movie_name.strip()
             if not name:
                 st.warning("Enter a movie name first.")
+            elif len(name) < 3:
+                st.warning("Please type at least 3 characters of the film name.")
             else:
                 rows, notes, vids = [], [], []
                 try:
                     with st.spinner("Fetching comments..."):
                         vids, _kind = search_videos_smart(name, release_ts, str(matched["language"]) if matched is not None else "", api_key)
                         if not vids:
-                            notes.append("No matching comments were found. Try the exact film title and check the spelling.")
+                            notes.append("No public comments were found for this title yet." + (f" Films with audience data you can try: {', '.join(suggestions)}." if suggestions else ""))
                         for vid in vids[:3]:
                             try:
                                 comments, status = yt_fetch_comments(vid["video_id"], per_video, api_key)
                             except YouTubeError as exc:
-                                notes.append(f"{vid['title']}: {explain_youtube_error(exc)}")
+                                notes.append(friendly_error(exc))
                                 if any(f in " ".join(exc.reasons).lower() or f in exc.message.lower() for f in FATAL_YT):
                                     break
                                 continue
                             if status == "comments_disabled":
-                                notes.append(f"Comments are turned off on “{vid['title']}”.")
+                                notes.append("Some comment sections are turned off, so fewer comments are shown.")
                             for c in comments:
                                 rows.append({"movie": name, "comment": c["comment"], "video_title": vid["title"],
                                              "channel": vid["channel"], "video_url": vid["url"],
@@ -2439,15 +2479,15 @@ elif page == "Viewer Reviews":
                     st.session_state.yt_videos, st.session_state.yt_videos_for = vids, name
                     st.session_state.yt_df, st.session_state.yt_notes = df, notes
                 except YouTubeError as exc:
-                    st.error(explain_youtube_error(exc))
+                    st.error(friendly_error(exc))
                 except requests.RequestException as exc:
-                    st.error(f"Network problem: {exc}")
+                    st.error("Comments could not be loaded right now. Please check the connection and try again.")
 
-        for note in st.session_state.yt_notes:
+        for note in (st.session_state.yt_notes if st.session_state.yt_videos_for == movie_name.strip() else []):
             st.warning(note)
 
         df = st.session_state.yt_df
-        if df is not None:
+        if df is not None and st.session_state.yt_videos_for == movie_name.strip():      # hide results of an earlier search
             if df.empty:
                 st.info("No comments could be analysed. See any messages above.")
             else:
@@ -2455,8 +2495,7 @@ elif page == "Viewer Reviews":
                 st.markdown(f"## Analysis: {st.session_state.yt_videos_for}")
                 counts = count_labels(df["sentiment"])
                 show_metrics(counts, "Comments collected")
-                st.caption(f"Public comments from {df['video_url'].nunique()} selected review video(s). "
-                           "Not a complete picture of all viewers.")
+                st.caption("Public viewer comments. Not a complete picture of all viewers.")
                 show_charts(counts, "Viewer comment sentiment")
                 show_comment_list(df, "yt")
                 d1, d2 = st.columns(2)
@@ -2465,7 +2504,7 @@ elif page == "Viewer Reviews":
                 if d2.button("Save to project dataset", key="yt_save"):
                     try:
                         added = save_collected(df)
-                        st.success(f"Saved {added} new comments to data/youtube_comments_collected.csv. "
+                        st.success(f"Saved {added} new comments to the project data. "
                                    "They now count in the Dashboard and Movie Explorer.")
                     except OSError as exc:
                         st.error(f"Could not write the file: {exc}")
